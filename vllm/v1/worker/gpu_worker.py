@@ -25,6 +25,7 @@ from vllm.distributed import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
+from vllm.distributed.ccl_profiler import ProfilePhase, get_ccl_profiler
 from vllm.distributed.ec_transfer import (
     ensure_ec_transfer_initialized,
     ensure_ec_transfer_shutdown,
@@ -1229,6 +1230,27 @@ class Worker(WorkerBase):
                 logger.warning("Profiler was not started, nothing to stop.")
                 return
             self.profiler.stop()
+
+    def start_ccl_profile_iteration(
+        self,
+        *,
+        phase: ProfilePhase,
+        batch_size: int | None = None,
+        input_len: int | None = None,
+        output_len: int | None = None,
+        max_events: int | None = None,
+    ) -> None:
+        get_ccl_profiler().start_iteration(
+            phase=phase,
+            rank=self.rank,
+            batch_size=batch_size,
+            input_len=input_len,
+            output_len=output_len,
+            max_events=max_events,
+        )
+
+    def finish_ccl_profile_iteration(self) -> dict[str, Any]:
+        return get_ccl_profiler().finish_iteration()
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)

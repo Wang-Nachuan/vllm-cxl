@@ -7,6 +7,7 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.distributed.ccl_profiler import get_ccl_profiler
 from vllm.distributed.device_communicators.all_reduce_utils import (
     NCCL_SYMM_MEM_ALL_REDUCE_CONFIG,
     should_nccl_symm_mem_ag_rs,
@@ -271,6 +272,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        ccl_profiler = get_ccl_profiler()
+        if ccl_profiler.forward_active:
+            pynccl_comm = self.pynccl_comm
+            if pynccl_comm is None or pynccl_comm.disabled:
+                raise RuntimeError("CCL profiling requires PyNccl AllReduce")
+            profile_metadata = ccl_profiler.all_reduce_metadata(
+                input_,
+                group_ranks=self.ranks,
+                rank_in_group=self.rank_in_group,
+            )
+            out = torch.empty_like(input_)
+            profile_token = ccl_profiler.begin_collective(profile_metadata)
+            try:
+                out = pynccl_comm.all_reduce(input_, out_tensor=out)
+            finally:
+                ccl_profiler.end_collective(profile_token)
+            if out is None:
+                raise RuntimeError("PyNccl AllReduce did not execute")
+            return out
+
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
@@ -428,16 +449,43 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # ncclCommWindowRegister is collective: asymmetric pool allocations
         # from variable per-rank sizes cause deadlocks.
         use_symm_mem = sizes is None and should_nccl_symm_mem_ag_rs()
+        ccl_profiler = get_ccl_profiler()
+        profile_metadata = None
+        if ccl_profiler.forward_active:
+            resolved_sizes = (
+                list(sizes) if sizes is not None else [chunk_size] * world_size
+            )
+            profile_metadata = ccl_profiler.ep_metadata(
+                sizes=resolved_sizes,
+                group_ranks=self.ranks,
+                rank_in_group=self.rank_in_group,
+            )
+        if use_symm_mem and profile_metadata is not None:
+            raise RuntimeError(
+                "CCL profiling requires NCCL symmetric-memory AG/RS to be disabled"
+            )
         if use_symm_mem:
             output = self._reduce_scatter_symm_mem(input_tensor)
         else:
             output = torch.empty(
                 output_shape, dtype=input_tensor.dtype, device=input_tensor.device
             )
-            if sizes is not None and sizes.count(sizes[0]) != len(sizes):
-                pynccl_comm.reduce_scatterv(output, input_tensor, sizes=sizes)
+            if profile_metadata is None:
+                if sizes is not None and sizes.count(sizes[0]) != len(sizes):
+                    pynccl_comm.reduce_scatterv(output, input_tensor, sizes=sizes)
+                else:
+                    pynccl_comm.reduce_scatter(output, input_tensor)
             else:
-                pynccl_comm.reduce_scatter(output, input_tensor)
+                profile_token = ccl_profiler.begin_collective(profile_metadata)
+                try:
+                    if sizes is not None and sizes.count(sizes[0]) != len(sizes):
+                        pynccl_comm.reduce_scatterv(
+                            output, input_tensor, sizes=sizes
+                        )
+                    else:
+                        pynccl_comm.reduce_scatter(output, input_tensor)
+                finally:
+                    ccl_profiler.end_collective(profile_token)
 
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
@@ -588,10 +636,30 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if sizes is not None and all(s == sizes[0] for s in sizes):
             sizes = None
 
+        ccl_profiler = get_ccl_profiler()
+        profile_metadata = None
+        resolved_sizes = None
+        if ccl_profiler.forward_active:
+            tensor_list = [input_] if isinstance(input_, torch.Tensor) else input_
+            resolved_sizes = (
+                list(sizes)
+                if sizes is not None
+                else [tensor_list[0].shape[0]] * world_size
+            )
+            profile_metadata = ccl_profiler.ep_metadata(
+                sizes=resolved_sizes,
+                group_ranks=self.ranks,
+                rank_in_group=self.rank_in_group,
+            )
+
         # Symmetric memory is only used when all ranks have uniform sizes.
         # ncclCommWindowRegister is collective: asymmetric pool allocations
         # from variable per-rank sizes cause deadlocks.
         if sizes is None and should_nccl_symm_mem_ag_rs():
+            if profile_metadata is not None:
+                raise RuntimeError(
+                    "CCL profiling requires NCCL symmetric-memory AG/RS to be disabled"
+                )
             if isinstance(input_, torch.Tensor):
                 return self._all_gather_symm_mem(input_)
             return self._all_gather_batched_symm_mem(input_)
@@ -617,7 +685,44 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return output_tensor
 
         if isinstance(input_, torch.Tensor):
+            if profile_metadata is not None:
+                assert resolved_sizes is not None
+                input_size = input_.size()
+                output_size = (sum(resolved_sizes),) + input_size[1:]
+                output_tensor = torch.empty(
+                    output_size, dtype=input_.dtype, device=input_.device
+                )
+                profile_token = ccl_profiler.begin_collective(profile_metadata)
+                try:
+                    if sizes is not None:
+                        pynccl_comm.all_gatherv(output_tensor, input_, sizes=sizes)
+                    else:
+                        pynccl_comm.all_gather(output_tensor, input_)
+                finally:
+                    ccl_profiler.end_collective(profile_token)
+                return output_tensor
             return _all_gather_single(input_, sizes)
+
+        if profile_metadata is not None:
+            assert resolved_sizes is not None
+            output_list = []
+            for inp in input_:
+                output_size = (sum(resolved_sizes),) + inp.size()[1:]
+                output_list.append(
+                    torch.empty(output_size, dtype=inp.dtype, device=inp.device)
+                )
+            profile_token = ccl_profiler.begin_collective(profile_metadata)
+            try:
+                pynccl_comm.group_start()
+                for output, inp in zip(output_list, input_):
+                    if sizes is not None:
+                        pynccl_comm.all_gatherv(output, inp, sizes=sizes)
+                    else:
+                        pynccl_comm.all_gather(output, inp)
+                pynccl_comm.group_end()
+            finally:
+                ccl_profiler.end_collective(profile_token)
+            return output_list
 
         output_list = []
         pynccl_comm.group_start()

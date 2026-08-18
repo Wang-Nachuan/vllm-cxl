@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +10,7 @@ import torch.distributed as dist
 
 import vllm.envs as envs
 from vllm.distributed import get_dp_group, get_ep_group, get_pcp_group
+from vllm.distributed.ccl_profiler import get_ccl_profiler
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -66,6 +68,32 @@ class AgRsAll2AllManager(All2AllManagerBase):
         assert sizes is not None
         return sizes
 
+    def _get_logical_sizes(
+        self, sizes: list[int], is_sequence_parallel: bool
+    ) -> list[int]:
+        dp_metadata = get_forward_context().dp_metadata
+        if dp_metadata is None:
+            return sizes
+        tokens_across_dp = [
+            int(value) for value in dp_metadata.num_tokens_across_dp_cpu.tolist()
+        ]
+        if not is_sequence_parallel:
+            return tokens_across_dp
+
+        sp_size = len(sizes) // len(tokens_across_dp)
+        logical_sizes = []
+        for num_tokens in tokens_across_dp:
+            chunk_size = (num_tokens + sp_size - 1) // sp_size
+            logical_sizes.extend(
+                min(max(num_tokens - rank * chunk_size, 0), chunk_size)
+                for rank in range(sp_size)
+            )
+        if len(logical_sizes) != len(sizes):
+            raise AssertionError(
+                f"Logical EP sizes {logical_sizes} do not match NCCL sizes {sizes}"
+            )
+        return logical_sizes
+
     def dispatch_router_logits(
         self,
         hidden_states: torch.Tensor,
@@ -87,11 +115,20 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
-        gathered_tensors = dist_group.all_gatherv(
-            tensors_to_gather,
-            dim=0,
-            sizes=sizes,
+        ccl_profiler = get_ccl_profiler()
+        profile_context = (
+            ccl_profiler.ep_collective(
+                "dispatch", self._get_logical_sizes(sizes, is_sequence_parallel)
+            )
+            if ccl_profiler.forward_active
+            else nullcontext()
         )
+        with profile_context:
+            gathered_tensors = dist_group.all_gatherv(
+                tensors_to_gather,
+                dim=0,
+                sizes=sizes,
+            )
 
         if extra_tensors is not None:
             return (gathered_tensors[0], gathered_tensors[1], gathered_tensors[2:])
@@ -119,15 +156,25 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
-        gathered_tensors = dist_group.all_gatherv(
-            tensors_to_gather,
-            dim=0,
-            sizes=sizes,
+        ccl_profiler = get_ccl_profiler()
+        profile_context = (
+            ccl_profiler.ep_collective(
+                "dispatch", self._get_logical_sizes(sizes, is_sequence_parallel)
+            )
+            if ccl_profiler.forward_active
+            else nullcontext()
         )
+        with profile_context:
+            gathered_tensors = dist_group.all_gatherv(
+                tensors_to_gather,
+                dim=0,
+                sizes=sizes,
+            )
 
         hidden_states = gathered_tensors[0]
         topk_weights = gathered_tensors[1]
         topk_ids = gathered_tensors[2]
+        ccl_profiler.capture_moe_routes(topk_ids)
 
         if extra_tensors is None:
             return hidden_states, topk_weights, topk_ids
@@ -145,7 +192,18 @@ class AgRsAll2AllManager(All2AllManagerBase):
             hidden_states.shape[0] // dist_group.world_size,
             dist_group,
         )
-        hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
+        ccl_profiler = get_ccl_profiler()
+        profile_context = (
+            ccl_profiler.ep_collective(
+                "combine", self._get_logical_sizes(sizes, is_sequence_parallel)
+            )
+            if ccl_profiler.forward_active
+            else nullcontext()
+        )
+        with profile_context:
+            hidden_states = dist_group.reduce_scatterv(
+                hidden_states, dim=0, sizes=sizes
+            )
         return hidden_states
 
     def destroy(self):

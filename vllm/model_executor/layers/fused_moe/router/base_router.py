@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 import torch
 
+from vllm.distributed.ccl_profiler import get_ccl_profiler
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
@@ -295,6 +296,9 @@ class BaseRouter(FusedMoERouter):
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
+        ccl_profiler = get_ccl_profiler()
+        if ccl_profiler.forward_active:
+            ccl_profiler.capture_moe_routes(topk_ids)
 
         # Step 3: Apply EPLB mapping
         topk_ids = self._apply_eplb_mapping(topk_ids)

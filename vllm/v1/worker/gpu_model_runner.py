@@ -37,6 +37,7 @@ from vllm.config import (
     update_config,
 )
 from vllm.config.cache import CacheConfig
+from vllm.distributed.ccl_profiler import get_ccl_profiler
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -4119,6 +4120,11 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        ccl_profiler = get_ccl_profiler()
+        profile_forward = ccl_profiler.select_forward(
+            scheduler_output.num_scheduled_tokens
+        )
+
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
 
@@ -4391,13 +4397,25 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            profile_token = None
+            if profile_forward:
+                if cudagraph_mode != CUDAGraphMode.NONE:
+                    raise RuntimeError(
+                        "CCL profiling requires cudagraph_mode=NONE, got "
+                        f"{cudagraph_mode}"
+                    )
+                profile_token = ccl_profiler.begin_forward()
+            try:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+            finally:
+                if profile_token is not None:
+                    ccl_profiler.end_forward(profile_token)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
