@@ -120,7 +120,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
             ccl_profiler.ep_collective(
                 "dispatch", self._get_logical_sizes(sizes, is_sequence_parallel)
             )
-            if ccl_profiler.forward_active
+            if ccl_profiler.capture_active
             else nullcontext()
         )
         with profile_context:
@@ -161,7 +161,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
             ccl_profiler.ep_collective(
                 "dispatch", self._get_logical_sizes(sizes, is_sequence_parallel)
             )
-            if ccl_profiler.forward_active
+            if ccl_profiler.capture_active
             else nullcontext()
         )
         with profile_context:
@@ -197,7 +197,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
             ccl_profiler.ep_collective(
                 "combine", self._get_logical_sizes(sizes, is_sequence_parallel)
             )
-            if ccl_profiler.forward_active
+            if ccl_profiler.capture_active
             else nullcontext()
         )
         with profile_context:

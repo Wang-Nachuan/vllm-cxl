@@ -273,7 +273,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
     def all_reduce(self, input_):
         ccl_profiler = get_ccl_profiler()
-        if ccl_profiler.forward_active:
+        if ccl_profiler.capture_active:
             pynccl_comm = self.pynccl_comm
             if pynccl_comm is None or pynccl_comm.disabled:
                 raise RuntimeError("CCL profiling requires PyNccl AllReduce")
@@ -451,7 +451,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         use_symm_mem = sizes is None and should_nccl_symm_mem_ag_rs()
         ccl_profiler = get_ccl_profiler()
         profile_metadata = None
-        if ccl_profiler.forward_active:
+        if ccl_profiler.capture_active:
             resolved_sizes = (
                 list(sizes) if sizes is not None else [chunk_size] * world_size
             )
@@ -639,7 +639,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ccl_profiler = get_ccl_profiler()
         profile_metadata = None
         resolved_sizes = None
-        if ccl_profiler.forward_active:
+        if ccl_profiler.capture_active:
             tensor_list = [input_] if isinstance(input_, torch.Tensor) else input_
             resolved_sizes = (
                 list(sizes)

@@ -297,7 +297,7 @@ class BaseRouter(FusedMoERouter):
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
         ccl_profiler = get_ccl_profiler()
-        if ccl_profiler.forward_active:
+        if ccl_profiler.capture_active:
             ccl_profiler.capture_moe_routes(topk_ids)
 
         # Step 3: Apply EPLB mapping

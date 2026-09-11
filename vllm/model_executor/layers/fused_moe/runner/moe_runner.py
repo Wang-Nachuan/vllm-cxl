@@ -12,6 +12,7 @@ from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.distributed.ccl_profiler import get_ccl_profiler
@@ -111,9 +112,66 @@ def _resolve_layer_name(layer_name: str | LayerName) -> str:
     return layer_name
 
 
-# Note: _moe_forward and _moe_forward_shared should not contain any
-# implementation details, They should merely pass along control to
-# the runner's '_forward_impl' method.
+def _run_moe_forward(
+    layer: "MoERunner",
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    activation_width: int,
+    final_output_width: int,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ccl_profiler = get_ccl_profiler()
+    if ccl_profiler.capture_active and layer._fused_output_is_reduced:
+        raise RuntimeError(
+            "CCL profiling requires MoE output reduction to remain a "
+            "separate communication operation"
+        )
+    tp_reduce = get_tp_group().world_size > 1 and (
+        layer.moe_config.tp_size > 1 or layer.moe_config.ep_size > 1
+    )
+    if (
+        ccl_profiler.capture_active
+        and tp_reduce
+        and layer.moe_config.skip_final_all_reduce
+    ):
+        raise RuntimeError(
+            "CCL profiling does not support deferred model-level MoE reduction"
+        )
+    profile_context = (
+        ccl_profiler.moe_layer(
+            ep_size=layer.moe_config.ep_size,
+            num_experts=layer.moe_config.num_experts,
+            placement=layer.routed_experts.expert_placement_strategy,
+            activation_width=activation_width,
+            activation_element_size=hidden_states.element_size(),
+            has_shared_experts=layer.shared_experts is not None,
+            ep_group_ranks=get_ep_group().ranks,
+        )
+        if ccl_profiler.capture_active
+        else nullcontext()
+    )
+    with profile_context:
+        output = layer._forward_impl(
+            hidden_states,
+            router_logits,
+            shared_experts_input,
+            input_ids,
+        )
+        if (
+            ccl_profiler.capture_active
+            and not layer.moe_config.is_sequence_parallel
+            and not layer.moe_config.skip_final_all_reduce
+            and tp_reduce
+            and not layer._fused_output_is_reduced
+        ):
+            ccl_profiler.defer_moe_final_all_reduce(final_output_width)
+        return output
+
+
+# These opaque custom-op implementations execute while CUDA graphs are
+# captured, so capture-time profiling belongs here rather than in the traced
+# ``MoERunner.forward`` wrapper.
 # These functions should never be called directly since they do not
 # include all the functionality of the MoE layer.
 def _moe_forward(
@@ -123,14 +181,22 @@ def _moe_forward(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    activation_width: int,
+    final_output_width: int,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
-    return layer._forward_impl(
+    assert isinstance(layer, MoERunner)
+    output = _run_moe_forward(
+        layer,
         hidden_states,
         router_logits,
         shared_experts_input,
         input_ids,
+        activation_width,
+        final_output_width,
     )
+    assert isinstance(output, torch.Tensor)
+    return output
 
 
 def _moe_forward_fake(
@@ -140,6 +206,8 @@ def _moe_forward_fake(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    activation_width: int,
+    final_output_width: int,
 ) -> torch.Tensor:
     # `hidden_dim_unpadded > 0` only on the TRT-LLM MXFP4 path, where the
     # real kernel writes narrower than `hidden_states.shape[-1]`. Plumbed
@@ -157,14 +225,22 @@ def _moe_forward_shared(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    activation_width: int,
+    final_output_width: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
-    return layer._forward_impl(
+    assert isinstance(layer, MoERunner)
+    output = _run_moe_forward(
+        layer,
         hidden_states,
         router_logits,
         shared_experts_input,
         input_ids,
+        activation_width,
+        final_output_width,
     )
+    assert isinstance(output, tuple)
+    return output
 
 
 def _moe_forward_shared_fake(
@@ -174,6 +250,8 @@ def _moe_forward_shared_fake(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    activation_width: int,
+    final_output_width: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # `fused_out`: see `_moe_forward_fake` for hidden_dim_unpadded semantics.
     # `shared_out`: matches `shared_experts_input` if provided (latent MoE),
@@ -462,13 +540,7 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not self._fused_output_is_reduced
         ):
-            ccl_profiler = get_ccl_profiler()
-            if ccl_profiler.forward_active:
-                logical_width = trunc_size or states.shape[-1]
-                with ccl_profiler.moe_final_all_reduce(logical_width):
-                    states = tensor_model_parallel_all_reduce(states)
-            else:
-                states = tensor_model_parallel_all_reduce(states)
+            states = tensor_model_parallel_all_reduce(states)
 
         return states[..., :trunc_size] if trunc_size is not None else states
 
@@ -689,66 +761,53 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        ccl_profiler = get_ccl_profiler()
-        profile_context = (
-            ccl_profiler.moe_layer(
-                ep_size=self.moe_config.ep_size,
-                num_experts=self.moe_config.num_experts,
-                placement=self.routed_experts.expert_placement_strategy,
-                activation_width=og_hidden_dim_pre_xform or hidden_states.shape[-1],
-                activation_element_size=hidden_states.element_size(),
-                has_shared_experts=self.shared_experts is not None,
-                ep_group_ranks=get_ep_group().ranks,
-            )
-            if ccl_profiler.forward_active
-            else nullcontext()
+        result = self._forward_entry(
+            hidden_states,
+            router_logits,
+            shared_experts_input,
+            input_ids,
+            self._encode_layer_name(),
+            self.moe_config.hidden_dim_unpadded
+            if self._quant_method.has_unpadded_output
+            else 0,
+            og_hidden_dim_pre_xform or hidden_states.shape[-1],
+            og_hidden_dim_post_xform or hidden_states.shape[-1],
         )
-        with profile_context:
-            result = self._forward_entry(
-                hidden_states,
-                router_logits,
-                shared_experts_input,
-                input_ids,
-                self._encode_layer_name(),
-                self.moe_config.hidden_dim_unpadded
-                if self._quant_method.has_unpadded_output
-                else 0,
-            )
 
-            #
-            # Note: there are two all-reduce points below. They are mutually
-            # exclusive, controlled by _fused_output_is_reduced
-            #  - When True: the combine kernel already reduced fused_output,
-            #    so we reduce shared_output here to match, then skip the
-            #    all-reduce in _maybe_reduce_final_output.
-            #  - When False: neither output is reduced yet, so we combine
-            #    them first and all-reduce the sum in _maybe_reduce_final_output.
+        #
+        # Note: there are two all-reduce points below. They are mutually
+        # exclusive, controlled by _fused_output_is_reduced
+        #  - When True: the combine kernel already reduced fused_output,
+        #    so we reduce shared_output here to match, then skip the
+        #    all-reduce in _maybe_reduce_final_output.
+        #  - When False: neither output is reduced yet, so we combine
+        #    them first and all-reduce the sum in _maybe_reduce_final_output.
 
-            # Extract outputs from result
-            shared_output, fused_output = _unpack(result)
+        # Extract outputs from result
+        shared_output, fused_output = _unpack(result)
 
-            if og_hidden_dim_pre_xform is not None:
-                fused_output = fused_output[..., :og_hidden_dim_pre_xform]
+        if og_hidden_dim_pre_xform is not None:
+            fused_output = fused_output[..., :og_hidden_dim_pre_xform]
 
-            # If combine kernel already reduced fused, reduce shared to match.
-            # See note above re: the two all-reduce points.
-            shared_output = self._maybe_reduce_shared_expert_output(shared_output)
+        # If combine kernel already reduced fused, reduce shared to match.
+        # See note above re: the two all-reduce points.
+        shared_output = self._maybe_reduce_shared_expert_output(shared_output)
 
-            shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
-                shared_output, fused_output
-            )
+        shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
+            shared_output, fused_output
+        )
 
-            # Apply output transform (e.g. latent -> full dim)
-            fused_output = self.apply_routed_output_transform(fused_output)
+        # Apply output transform (e.g. latent -> full dim)
+        fused_output = self.apply_routed_output_transform(fused_output)
 
-            if shared_output is not None:
-                result = shared_output + fused_output
-            else:
-                result = fused_output
+        if shared_output is not None:
+            result = shared_output + fused_output
+        else:
+            result = fused_output
 
-            result = self._maybe_reduce_final_output(result, og_hidden_dim_post_xform)
+        result = self._maybe_reduce_final_output(result, og_hidden_dim_post_xform)
 
-            return self._maybe_add_zero_expert_output(result)
+        return self._maybe_add_zero_expert_output(result)
 
     @property
     def do_naive_dispatch_combine(self) -> bool:

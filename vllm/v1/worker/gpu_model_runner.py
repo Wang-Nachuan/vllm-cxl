@@ -939,6 +939,7 @@ class GPUModelRunner(
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
+        self._ccl_profile_token: int | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
@@ -3720,6 +3721,10 @@ class GPUModelRunner(
                     self.routed_experts_slot_mapping_device[:total],
                     non_blocking=True,
                 )
+            if self._ccl_profile_token is not None:
+                get_ccl_profiler().enqueue_route_snapshot(
+                    self._ccl_profile_token
+                )
 
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
@@ -3740,6 +3745,9 @@ class GPUModelRunner(
                     discard_sampled_tokens_req_indices,
                     logprobs_tensors=logprobs_tensors,
                 )
+            if self._ccl_profile_token is not None:
+                get_ccl_profiler().drain_forward(self._ccl_profile_token)
+                self._ccl_profile_token = None
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
@@ -4119,6 +4127,8 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if self._ccl_profile_token is not None:
+            raise RuntimeError("The previous CCL-profiled forward was not drained")
 
         ccl_profiler = get_ccl_profiler()
         profile_forward = ccl_profiler.select_forward(
@@ -4399,12 +4409,20 @@ class GPUModelRunner(
         ):
             profile_token = None
             if profile_forward:
-                if cudagraph_mode != CUDAGraphMode.NONE:
+                if self.use_async_scheduling:
                     raise RuntimeError(
-                        "CCL profiling requires cudagraph_mode=NONE, got "
-                        f"{cudagraph_mode}"
+                        "CCL profiling requires synchronous scheduling"
                     )
-                profile_token = ccl_profiler.begin_forward()
+                if cudagraph_mode == CUDAGraphMode.NONE:
+                    raise RuntimeError(
+                        "CCL profiling requires a captured CUDA graph"
+                    )
+                profile_token = ccl_profiler.begin_forward(
+                    cudagraph_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                )
+                self._ccl_profile_token = profile_token
             try:
                 model_output = self._model_forward(
                     input_ids=input_ids,
@@ -6504,11 +6522,10 @@ class GPUModelRunner(
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
+        CUDAGraphWrapper.clear_all_graphs()
+        BreakableCUDAGraphWrapper.clear_all_graphs()
+        get_ccl_profiler().clear_layouts()
         if current_platform.is_rocm():
-            # Drop captured graphs before distributed teardown. On ROCm, delayed
-            # graph destruction can surface HSA faults in the next engine startup.
-            CUDAGraphWrapper.clear_all_graphs()
-            BreakableCUDAGraphWrapper.clear_all_graphs()
             self.encoder_cudagraph_manager = None
         self.compilation_config.static_forward_context.clear()
         self.model = None  # type: ignore[assignment]
@@ -6728,6 +6745,7 @@ class GPUModelRunner(
             set_cudagraph_capturing_enabled(False)
             CUDAGraphWrapper.clear_all_graphs()
             BreakableCUDAGraphWrapper.clear_all_graphs()
+            get_ccl_profiler().clear_layouts()
             if encoder_cudagraph_manager is not None:
                 encoder_cudagraph_manager.clear()
             all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
@@ -6838,6 +6856,12 @@ class GPUModelRunner(
                 encoder_graph_pool = current_platform.graph_pool_handle()
                 self.encoder_cudagraph_manager.capture(graph_pool=encoder_graph_pool)
 
+            get_ccl_profiler().validate_layouts(
+                require_moe=self.model_config.is_moe,
+                expected_moe_calls=len(
+                    self.compilation_config.static_all_moe_layers
+                ),
+            )
             torch.accelerator.synchronize()
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
@@ -6892,8 +6916,22 @@ class GPUModelRunner(
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
             )
+        ccl_profiler = get_ccl_profiler()
+        with ccl_profiler.prepare_layout(cudagraph_runtime_mode, desc):
+            self._dummy_run(
+                desc.num_tokens,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                force_attention=force_attention,
+                uniform_decode=desc.uniform,
+                allow_microbatching=allow_microbatching,
+                skip_eplb=True,
+                remove_lora=False,
+                num_active_loras=desc.num_active_loras,
+                profile_seq_lens=profile_seq_lens,
+            )
         with (
             profiler,
+            ccl_profiler.capture_layout(cudagraph_runtime_mode, desc),
             torch.profiler.record_function(
                 f"capture_{desc.num_tokens}_{cudagraph_runtime_mode.name}"
             ),

@@ -1238,15 +1238,18 @@ class Worker(WorkerBase):
         batch_size: int | None = None,
         input_len: int | None = None,
         output_len: int | None = None,
-        max_events: int | None = None,
     ) -> None:
+        profile_rank = (
+            self.parallel_config.data_parallel_index
+            * self.parallel_config.world_size
+            + self.rank
+        )
         get_ccl_profiler().start_iteration(
             phase=phase,
-            rank=self.rank,
+            rank=profile_rank,
             batch_size=batch_size,
             input_len=input_len,
             output_len=output_len,
-            max_events=max_events,
         )
 
     def finish_ccl_profile_iteration(self) -> dict[str, Any]:
