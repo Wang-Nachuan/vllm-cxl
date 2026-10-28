@@ -3721,10 +3721,6 @@ class GPUModelRunner(
                     self.routed_experts_slot_mapping_device[:total],
                     non_blocking=True,
                 )
-            if self._ccl_profile_token is not None:
-                get_ccl_profiler().enqueue_route_snapshot(
-                    self._ccl_profile_token
-                )
 
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
@@ -3745,9 +3741,6 @@ class GPUModelRunner(
                     discard_sampled_tokens_req_indices,
                     logprobs_tensors=logprobs_tensors,
                 )
-            if self._ccl_profile_token is not None:
-                get_ccl_profiler().drain_forward(self._ccl_profile_token)
-                self._ccl_profile_token = None
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
@@ -4128,7 +4121,7 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
         if self._ccl_profile_token is not None:
-            raise RuntimeError("The previous CCL-profiled forward was not drained")
+            raise RuntimeError("The previous CCL-profiled step did not sample")
 
         ccl_profiler = get_ccl_profiler()
         profile_forward = ccl_profiler.select_forward(
@@ -4407,33 +4400,24 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            profile_token = None
             if profile_forward:
-                if self.use_async_scheduling:
-                    raise RuntimeError(
-                        "CCL profiling requires synchronous scheduling"
-                    )
                 if cudagraph_mode == CUDAGraphMode.NONE:
                     raise RuntimeError(
                         "CCL profiling requires a captured CUDA graph"
                     )
-                profile_token = ccl_profiler.begin_forward(
+                # The profiled step lasts until sample_tokens() has sampled.
+                self._ccl_profile_token = ccl_profiler.begin_forward(
                     cudagraph_mode=cudagraph_mode,
                     batch_descriptor=batch_desc,
                     num_tokens_unpadded=num_tokens_unpadded,
                 )
-                self._ccl_profile_token = profile_token
-            try:
-                model_output = self._model_forward(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
-            finally:
-                if profile_token is not None:
-                    ccl_profiler.end_forward(profile_token)
+            model_output = self._model_forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4567,6 +4551,9 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if self._ccl_profile_token is not None:
+            get_ccl_profiler().end_step(self._ccl_profile_token)
+            self._ccl_profile_token = None
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -6785,6 +6772,9 @@ class GPUModelRunner(
                 "ensure `cudagraph_mode` was not manually set to `NONE`"
             )
             return 0
+
+        # CUPTI must record before the graphs below are instantiated.
+        get_ccl_profiler().start_tracing()
 
         # Initialize encoder CUDA graph manager if enabled.
         self._maybe_init_encoder_cudagraph_manager()

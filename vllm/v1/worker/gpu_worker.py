@@ -359,6 +359,14 @@ class Worker(WorkerBase):
                 current_platform.logical_device_id_to_visible_device_id(self.local_rank)
             )
             self.device = torch.device(f"cuda:{visible_device_index}")
+            # CUPTI hardware tracing (Blackwell and newer) must be selected
+            # before set_device_index creates the CUDA context.
+            hw_trace = os.environ.get("CCL_PROFILER_HW_TRACE")
+            capability = current_platform.get_device_capability(visible_device_index)
+            assert capability is not None
+            get_ccl_profiler().initialize_tracing(
+                hw_trace=capability.major >= 10 if hw_trace is None else hw_trace == "1"
+            )
             torch.accelerator.set_device_index(self.device)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
@@ -1252,8 +1260,11 @@ class Worker(WorkerBase):
             output_len=output_len,
         )
 
-    def finish_ccl_profile_iteration(self) -> dict[str, Any]:
-        return get_ccl_profiler().finish_iteration()
+    def finish_ccl_profile_iteration(self) -> None:
+        get_ccl_profiler().finish_iteration()
+
+    def collect_ccl_profile_iterations(self, last: int) -> list[dict[str, Any]]:
+        return get_ccl_profiler().collect_iterations(last)
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)

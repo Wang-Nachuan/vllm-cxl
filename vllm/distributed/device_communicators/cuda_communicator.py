@@ -366,11 +366,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # gather-before-GEMM uses dim=0 with tp-aligned (uniform) shards.
         if dim < 0:
             dim += input_.dim()
+        ccl_profiler = get_ccl_profiler()
+        profiling = ccl_profiler.capture_active or ccl_profiler.step_active
         if dim == 0 and should_nccl_symm_mem_ag_rs():
+            if profiling:
+                raise RuntimeError(
+                    "CCL profiling requires NCCL symmetric-memory AG/RS to be disabled"
+                )
             return self._all_gather_symm_mem(input_.contiguous())
 
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
+            if profiling:
+                raise RuntimeError("CCL profiling requires PyNccl AllGather")
             return super().all_gather(input_, dim)
 
         # On ROCm, the base-class all_gather (all_gather_into_tensor) is faster
@@ -386,7 +394,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
         output_tensor = torch.empty(
             output_size, dtype=input_.dtype, device=input_.device
         )
-        pynccl_comm.all_gather(output_tensor, input_.contiguous())
+        input_ = input_.contiguous()
+        if profiling:
+            metadata = ccl_profiler.value_independent_metadata(
+                "all_gather",
+                input_,
+                group_ranks=self.ranks,
+                rank_in_group=self.rank_in_group,
+            )
+        if ccl_profiler.capture_active:
+            # Graph all-gathers, such as sequence-parallel MoE outputs.
+            profile_token = ccl_profiler.begin_collective(metadata)
+            try:
+                pynccl_comm.all_gather(output_tensor, input_)
+            finally:
+                ccl_profiler.end_collective(profile_token)
+        elif ccl_profiler.step_active:
+            # Eager collectives inside a profiled step, such as the logits
+            # all-gather, are timed as their own logical collectives.
+            ccl_profiler.add_eager_collective(metadata)
+            pynccl_comm.all_gather(output_tensor, input_)
+        else:
+            pynccl_comm.all_gather(output_tensor, input_)
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         return output_tensor.reshape(
@@ -411,13 +440,33 @@ class CudaCommunicator(DeviceCommunicatorBase):
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
+        ccl_profiler = get_ccl_profiler()
         if should_nccl_symm_mem_ag_rs():
+            if ccl_profiler.capture_active or ccl_profiler.step_active:
+                raise RuntimeError(
+                    "CCL profiling requires NCCL symmetric-memory AG/RS to be disabled"
+                )
             output = self._reduce_scatter_symm_mem(input_tensor)
         else:
             output = torch.empty(
                 output_shape, dtype=input_tensor.dtype, device=input_tensor.device
             )
-            pynccl_comm.reduce_scatter(output, input_tensor)
+            # Graph reduce-scatters, such as Qwen3-Next sequence-parallel
+            # attention outputs, are timed like graph AllReduces.
+            profile_token = ccl_profiler.begin_collective(
+                ccl_profiler.value_independent_metadata(
+                    "reduce_scatter",
+                    input_tensor,
+                    group_ranks=self.ranks,
+                    rank_in_group=self.rank_in_group,
+                )
+                if ccl_profiler.capture_active
+                else None
+            )
+            try:
+                pynccl_comm.reduce_scatter(output, input_tensor)
+            finally:
+                ccl_profiler.end_collective(profile_token)
 
         # Reshape before returning
         return output.movedim(0, dim).contiguous()

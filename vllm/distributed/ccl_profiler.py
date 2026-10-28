@@ -4,17 +4,219 @@
 from __future__ import annotations
 
 import base64
+import ctypes
+import threading
+from bisect import bisect_left
+from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from math import prod
-from time import monotonic_ns
-from typing import Any, Literal
+from pathlib import Path
+from typing import Any, Literal, NamedTuple
 
 import torch
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 ProfilePhase = Literal["prefill", "decode"]
 EPDirection = Literal["dispatch", "combine"]
+
+# While CUDA graphs are prepared, CUPTI attaches the innermost pushed external
+# ID to every traced CUDA API call, and every GPU record carries the correlation
+# ID of the call that launched it; that maps each collective to its NCCL
+# kernels. Measured steps trace GPU records only, because API tracing costs host
+# time on every CUDA call and stretches host-bound steps such as eager prefill.
+# A marker kernel on the compute stream brackets each measured step instead.
+# One buffer holds every iteration of a case; see collect_iterations().
+_TRACE_BUFFER_BYTES = 256 << 20
+_STEP_MARKER = "spin_kernel"
+
+
+class GpuActivity(NamedTuple):
+    correlation_id: int
+    start: int
+    end: int
+    graph_id: int
+    stream_id: int
+    # Empty for memcpy and memset records.
+    name: str
+
+
+class CorrelationTag(NamedTuple):
+    external_id: int
+    correlation_id: int
+
+
+def _is_nccl_kernel(name: str) -> bool:
+    return "nccl" in name
+
+
+class _CuptiTrace:
+    """Process-wide CUPTI activity collection.
+
+    CUPTI timestamps every kernel, memcpy, and memset, including nodes replayed
+    from CUDA graphs, without adding work to the graph. Records are converted
+    only when CUPTI completes a buffer. A large buffer that is flushed and
+    replaced between iterations keeps that host work outside profiled steps.
+    """
+
+    def __init__(self) -> None:
+        self._cupti: Any = None
+        self._lock = threading.Lock()
+        self._activities: list[GpuActivity] = []
+        self._tags: list[CorrelationTag] = []
+        self._flushing = False
+        # Buffers that filled up on their own instead of being flushed.
+        self.overflows = 0
+        self.active = False
+        self._api_tracing = False
+
+    def initialize(self, hw_trace: bool) -> None:
+        """Register CUPTI buffers; call before the CUDA context exists."""
+        from cupti import cupti
+
+        if hw_trace:
+            from cuda.bindings import driver
+
+            # Blackwell hardware event tracing timestamps kernels without
+            # instrumenting them. It needs an initialized driver but no context
+            # yet, and it loads libnvperf_host.so, which the pip CUPTI package
+            # installs next to libcupti but outside the loader's search path.
+            (result,) = driver.cuInit(0)
+            if result != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"cuInit failed: {result}")
+            cupti.get_timestamp()
+            cupti_path = next(
+                line.split()[-1]
+                for line in Path("/proc/self/maps").read_text().splitlines()
+                if "libcupti.so" in line
+            )
+            ctypes.CDLL(
+                str(Path(cupti_path).with_name("libnvperf_host.so")),
+                mode=ctypes.RTLD_GLOBAL,
+            )
+            cupti.activity_enable_hw_trace(1)
+        # Share one record buffer across threads. Each new buffer stalls the
+        # CUDA call that requests it for several milliseconds, and per-thread
+        # buffers would make every CUDA-calling thread do so after each flush.
+        per_thread = ctypes.c_uint8(0)
+        size = ctypes.c_size_t(ctypes.sizeof(per_thread))
+        cupti.activity_set_attribute(
+            cupti.ActivityAttribute.ATTR_PER_THREAD_BUFFER,
+            ctypes.addressof(size),
+            ctypes.addressof(per_thread),
+        )
+        cupti.activity_register_callbacks(
+            self._buffer_requested, self._buffer_completed
+        )
+        kind = cupti.ActivityKind
+        self._kernel_kind = int(kind.CONCURRENT_KERNEL)
+        self._copy_kinds = (int(kind.MEMCPY), int(kind.MEMSET))
+        self._correlation_kind = int(kind.EXTERNAL_CORRELATION)
+        self._external_kind = int(cupti.ExternalCorrelationKind.CUSTOM0)
+        self._gpu_kinds = (kind.CONCURRENT_KERNEL, kind.MEMCPY, kind.MEMSET)
+        # CUPTI emits external correlation records only for traced runtime and
+        # driver API calls.
+        self._api_kinds = (kind.RUNTIME, kind.DRIVER, kind.EXTERNAL_CORRELATION)
+        self._cupti = cupti
+
+    def start(self) -> None:
+        """Start recording; call before CUDA graphs are instantiated."""
+        if self._cupti is None:
+            raise RuntimeError(
+                "CUPTI tracing was not initialized before CUDA context creation"
+            )
+        for kind in self._gpu_kinds + self._api_kinds:
+            self._cupti.activity_enable(kind)
+        self.active = True
+        self._api_tracing = True
+
+    def stop_api_tracing(self) -> None:
+        for kind in self._api_kinds:
+            self._cupti.activity_disable(kind)
+        self._api_tracing = False
+
+    def push(self, external_id: int) -> None:
+        self._cupti.activity_push_external_correlation_id(
+            self._external_kind, external_id
+        )
+
+    def pop(self) -> int:
+        return self._cupti.activity_pop_external_correlation_id(self._external_kind)
+
+    @staticmethod
+    def mark() -> None:
+        torch.cuda._sleep(0)
+
+    def drain(self) -> tuple[list[GpuActivity], list[CorrelationTag]]:
+        """Return and clear the records of all GPU work issued so far."""
+        torch.cuda.synchronize()
+        self._flushing = True
+        try:
+            self._cupti.activity_flush_all(
+                int(self._cupti.ActivityFlag.FLUSH_FORCED)
+            )
+        finally:
+            self._flushing = False
+        with self._lock:
+            activities, self._activities = self._activities, []
+            tags, self._tags = self._tags, []
+        # A traced CUDA call makes CUPTI allocate the next buffer here rather
+        # than in the first step that follows, which would stall it for
+        # milliseconds. Measured steps trace no API calls, so trace this one.
+        runtime = self._cupti.ActivityKind.RUNTIME
+        if not self._api_tracing:
+            self._cupti.activity_enable(runtime)
+        torch.cuda.current_stream().query()
+        if not self._api_tracing:
+            self._cupti.activity_disable(runtime)
+        return activities, tags
+
+    @staticmethod
+    def _buffer_requested() -> tuple[int, int]:
+        return _TRACE_BUFFER_BYTES, 0
+
+    def _buffer_completed(self, records: list[Any]) -> None:
+        if not self._flushing:
+            self.overflows += 1
+        activities = []
+        tags = []
+        for record in records:
+            kind = record.kind
+            if kind == self._kernel_kind:
+                activities.append(
+                    GpuActivity(
+                        record.correlation_id,
+                        record.start,
+                        record.end,
+                        record.graph_id,
+                        record.stream_id,
+                        record.name,
+                    )
+                )
+            elif kind in self._copy_kinds:
+                activities.append(
+                    GpuActivity(
+                        record.correlation_id,
+                        record.start,
+                        record.end,
+                        record.graph_id,
+                        record.stream_id,
+                        "",
+                    )
+                )
+            elif (
+                kind == self._correlation_kind
+                and record.external_kind == self._external_kind
+            ):
+                tags.append(
+                    CorrelationTag(record.external_id, record.correlation_id)
+                )
+        with self._lock:
+            self._activities.extend(activities)
+            self._tags.extend(tags)
 
 
 @dataclass
@@ -29,7 +231,7 @@ class _MoELayerCall:
     ep_group_ranks: list[int]
     route_specs: list[_RouteSpec] = field(default_factory=list)
     route_offset: int | None = None
-    route_buffer: torch.Tensor | None = None
+    route_tensor: torch.Tensor | None = None
     route_source_sizes: list[int] | None = None
     route_group_ranks: list[int] | None = None
 
@@ -44,8 +246,7 @@ class _RouteSpec:
 @dataclass
 class _CollectiveLayout:
     metadata: dict[str, Any]
-    start: torch.cuda.Event
-    end: torch.cuda.Event
+    kernel_names: list[str] | None = None
 
 
 @dataclass
@@ -55,6 +256,9 @@ class _GraphLayout:
     collectives: list[_CollectiveLayout] = field(default_factory=list)
     layers: list[_MoELayerCall] = field(default_factory=list)
     route_buffer: torch.Tensor | None = None
+    route_sources: list[torch.Tensor] = field(default_factory=list)
+    all_to_all_group_size: int = 0
+    sequence_parallel_size: int | None = None
     captured: bool = False
     host_route_slots: list[_HostRouteSlot] = field(default_factory=list)
 
@@ -77,33 +281,18 @@ class _LayoutPass:
     deferred_moe_all_reduce: tuple[int, int] | None = None
     open_collective: int | None = None
     route_indices: dict[int, int] = field(default_factory=dict)
+    collective_tag_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
-class _PendingForward:
+class _ProfiledStep:
     token: int
     layout: _GraphLayout
-    start: torch.cuda.Event
-    end: torch.cuda.Event
     num_tokens_unpadded: int
     logical_source_sizes: list[int]
     host_route_buffer: torch.Tensor | None
     host_routes: dict[int, torch.Tensor]
-    host_start_ns: int
-    ended: bool = False
-    routes_enqueued: bool = False
-
-
-@dataclass
-class _DrainedForward:
-    forward_id: int
-    layout: _GraphLayout
-    elapsed_ms: float
-    collective_times: list[tuple[float, float]]
-    num_tokens_unpadded: int
-    logical_source_sizes: list[int]
-    host_routes: dict[int, torch.Tensor]
-    host_start_ns: int
+    eager_collectives: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _expert_owner_table(
@@ -193,17 +382,21 @@ def _ep_pattern(
         or routes.shape[0] < total_rows
         or len(source_sizes) != len(logical_source_sizes)
         or len(source_sizes) != len(collective_group_ranks)
-        or len(ep_group_ranks) != ep_size
     ):
         raise ValueError("MoE routes and EP size metadata do not match")
 
-    expert_bits = _expert_bits(
-        num_experts=num_experts,
-        ep_size=ep_size,
-        ep_group_ranks=ep_group_ranks,
-        collective_group_ranks=collective_group_ranks,
-        placement=placement,
-    )
+    if ep_size == 1:
+        # Without EP, DP ranks still dispatch and combine, but every rank
+        # holds a slice of every expert.
+        expert_bits = [(1 << len(collective_group_ranks)) - 1] * num_experts
+    else:
+        expert_bits = _expert_bits(
+            num_experts=num_experts,
+            ep_size=ep_size,
+            ep_group_ranks=ep_group_ranks,
+            collective_group_ranks=collective_group_ranks,
+            placement=placement,
+        )
     route_rows = routes[:total_rows].to(dtype=torch.int64).tolist()
     source_masks: list[int] = []
     destination_masks: list[int] = []
@@ -231,16 +424,20 @@ def _ep_pattern(
 
 
 class CCLProfiler:
-    """CUDA-graph-aware profiler for logical PyNccl collectives.
+    """CUDA-graph-aware profiler for logical NCCL collectives.
 
-    A layout is prepared during an ordinary dummy pass, then populated with
-    external CUDA event nodes during capture. Runtime graph replays update the
-    layout's persistent events and route buffers. The caller must drain every
-    profiled replay after vLLM's existing scheduler synchronization and before
-    replaying the same graph again.
+    An ordinary dummy pass discovers each graph layout's logical collectives,
+    the NCCL kernels each one launches, and the MoE route tensors. The
+    following CUDA-graph capture inserts nothing into the graph; it only keeps
+    references to the captured route tensors, whose memory every replay
+    rewrites. A profiled step spans the model forward, logits, and sampling,
+    bracketed by two marker kernels. After the iteration ends, the CUPTI
+    records between the markers resolve the step's GPU interval and the
+    interval of every logical collective.
     """
 
     def __init__(self) -> None:
+        self._trace = _CuptiTrace()
         self._layouts: dict[tuple[Any, Any], _GraphLayout] = {}
         self._layout_pass: _LayoutPass | None = None
         self._iteration: dict[str, Any] | None = None
@@ -248,10 +445,11 @@ class CCLProfiler:
         self._forward_id = -1
         self._profiled_forwards = 0
         self._prefill_seen = False
-        self._forward_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
-        self._pending_forward: _PendingForward | None = None
-        self._drained_forwards: list[_DrainedForward] = []
+        self._step: _ProfiledStep | None = None
+        self._finished_steps: list[_ProfiledStep] = []
+        self._pending_iterations: list[tuple[int, list[_ProfiledStep]]] = []
         self._layout_slot_counts: dict[tuple[Any, Any], int] = {}
+        self._next_tag_id = 1
 
     @property
     def iteration_active(self) -> bool:
@@ -261,6 +459,26 @@ class CCLProfiler:
     def capture_active(self) -> bool:
         """Whether a layout-discovery or CUDA-graph capture pass is active."""
         return self._layout_pass is not None
+
+    @property
+    def step_active(self) -> bool:
+        """Whether a profiled step has started and not finished sampling."""
+        return self._step is not None
+
+    def initialize_tracing(self, *, hw_trace: bool) -> None:
+        self._trace.initialize(hw_trace)
+        logger.info(
+            "CCL profiler timestamps GPU kernels with CUPTI %s tracing",
+            "hardware" if hw_trace else "software",
+        )
+
+    def start_tracing(self) -> None:
+        self._trace.start()
+
+    def _new_tag_id(self) -> int:
+        tag_id = self._next_tag_id
+        self._next_tag_id += 1
+        return tag_id
 
     @staticmethod
     def _layout_key(
@@ -281,7 +499,6 @@ class CCLProfiler:
         if self.capture_active or self.iteration_active:
             raise RuntimeError("Cannot clear CCL layouts while profiling is active")
         self._layouts.clear()
-        self._forward_events = None
 
     def validate_layouts(
         self, *, require_moe: bool, expected_moe_calls: int
@@ -290,6 +507,12 @@ class CCLProfiler:
             not layout.captured for layout in self._layouts.values()
         ):
             raise RuntimeError("CCL CUDA graph layouts are incomplete")
+        if any(
+            collective.kernel_names is None
+            for layout in self._layouts.values()
+            for collective in layout.collectives
+        ):
+            raise RuntimeError("CCL layouts were prepared without CUPTI tracing")
         if require_moe and any(
             not layout.layers for layout in self._layouts.values()
         ):
@@ -303,6 +526,11 @@ class CCLProfiler:
             raise RuntimeError(
                 "CCL layouts do not cover every registered MoE layer"
             )
+        # Only the layout passes need CUDA API records; measured steps are
+        # bracketed by marker kernels. Start measuring with an empty buffer.
+        self._trace.stop_api_tracing()
+        self._trace.drain()
+        self._trace.overflows = 0
 
     @contextmanager
     def prepare_layout(self, cudagraph_mode: Any, batch_descriptor: Any):
@@ -333,43 +561,59 @@ class CCLProfiler:
                 device = next(iter(devices))
                 if device.type != "cuda":
                     raise RuntimeError("MoE route capture requires a CUDA tensor")
-                dtype = next(iter(dtypes))
-                route_elements = sum(prod(spec.shape) for spec in route_specs)
                 layout.route_buffer = torch.empty(
-                    route_elements,
-                    dtype=dtype,
+                    sum(prod(spec.shape) for spec in route_specs),
+                    dtype=next(iter(dtypes)),
                     device=device,
                 )
                 offset = 0
                 for layer, spec in zip(route_layers, route_specs):
-                    elements = prod(spec.shape)
                     layer.route_offset = offset
-                    layer.route_buffer = layout.route_buffer[
-                        offset : offset + elements
-                    ].view(spec.shape)
-                    offset += elements
+                    offset += prod(spec.shape)
             for collective in layout.collectives:
                 call_id = collective.metadata.get("layer_call_id")
-                if call_id is not None and layout.layers[call_id].route_buffer is None:
+                if call_id is not None and layout.layers[call_id].route_offset is None:
                     raise RuntimeError(
                         f"MoE layer {call_id} did not expose routing decisions"
                     )
-            if self._forward_events is None:
-                self._forward_events = (
-                    torch.cuda.Event(enable_timing=True),
-                    torch.cuda.Event(enable_timing=True),
-                )
-                for event in self._forward_events:
-                    event.record()
+            if self._trace.active:
+                self._assign_collective_kernels(layout, state.collective_tag_ids)
             succeeded = True
         finally:
             self._layout_pass = None
             if not succeeded and self._layouts.get(key) is layout:
                 del self._layouts[key]
 
+    def _assign_collective_kernels(
+        self, layout: _GraphLayout, tag_ids: list[int]
+    ) -> None:
+        """Record the NCCL kernels each collective launched in the dummy pass."""
+        activities, tags = self._trace.drain()
+        index_of_tag = {tag_id: index for index, tag_id in enumerate(tag_ids)}
+        index_of_call = {
+            tag.correlation_id: index_of_tag[tag.external_id]
+            for tag in tags
+            if tag.external_id in index_of_tag
+        }
+        kernels: dict[int, list[GpuActivity]] = defaultdict(list)
+        for activity in activities:
+            index = index_of_call.get(activity.correlation_id)
+            if index is not None and activity.name:
+                kernels[index].append(activity)
+        for index, collective in enumerate(layout.collectives):
+            names = [
+                kernel.name
+                for kernel in sorted(kernels[index], key=lambda kernel: kernel.start)
+            ]
+            if not names or not all(_is_nccl_kernel(name) for name in names):
+                raise RuntimeError(
+                    f"Logical collective {index} launched unexpected kernels: {names}"
+                )
+            collective.kernel_names = names
+
     @contextmanager
     def capture_layout(self, cudagraph_mode: Any, batch_descriptor: Any):
-        """Record prepared timing and route nodes into one CUDA graph layout."""
+        """Check one CUDA-graph capture against its prepared layout."""
         if self.capture_active:
             raise RuntimeError("Nested CCL layout passes are not supported")
         if self.iteration_active:
@@ -387,6 +631,20 @@ class CCLProfiler:
         try:
             yield
             self._validate_layout_pass(state)
+            # view() fails rather than silently snapshotting a copy.
+            layout.route_sources = [
+                layer.route_tensor.view(-1)
+                for layer in layout.layers
+                if layer.route_tensor is not None
+            ]
+            group_sizes = {
+                len(collective.metadata["group_ranks"])
+                for collective in layout.collectives
+                if collective.metadata["op"] == "all_to_all"
+            }
+            if len(group_sizes) > 1:
+                raise RuntimeError("A CCL layout has inconsistent AlltoAll groups")
+            layout.all_to_all_group_size = next(iter(group_sizes), 0)
             layout.captured = True
         finally:
             self._layout_pass = None
@@ -438,6 +696,8 @@ class CCLProfiler:
             raise ValueError("CCL profiling dimensions must be positive")
         if phase == "prefill" and output_len != 1:
             raise ValueError("Prefill profiling requires output_len=1")
+        if not self._trace.active:
+            raise RuntimeError("CUPTI tracing is not active")
 
         self._iteration = {
             "phase": phase,
@@ -449,8 +709,8 @@ class CCLProfiler:
         self._forward_id = -1
         self._profiled_forwards = 0
         self._prefill_seen = False
-        self._pending_forward = None
-        self._drained_forwards.clear()
+        self._step = None
+        self._finished_steps.clear()
         self._layout_slot_counts.clear()
         self._prepare_iteration_route_slots()
 
@@ -542,40 +802,37 @@ class CCLProfiler:
         num_tokens_unpadded: int,
         logical_source_sizes: list[int] | None = None,
     ) -> int:
+        """Start a profiled step; GPU work launched until end_step belongs to it."""
         if not self.iteration_active:
             raise RuntimeError("No CCL profiling iteration is active")
-        if self._pending_forward is not None:
-            raise RuntimeError(
-                "The previous profiled graph replay has not been drained"
-            )
+        if self._step is not None:
+            raise RuntimeError("The previous profiled step has not finished sampling")
         key = self._layout_key(cudagraph_mode, batch_descriptor)
         layout = self._layouts.get(key)
         if layout is None or not layout.captured:
             raise RuntimeError(f"No captured CCL layout exists for {key!r}")
         if num_tokens_unpadded <= 0:
             raise ValueError("A profiled forward must contain at least one token")
-        all_to_all_group_sizes = {
-            len(collective.metadata["group_ranks"])
-            for collective in layout.collectives
-            if collective.metadata["op"] == "all_to_all"
-        }
-        if len(all_to_all_group_sizes) > 1:
-            raise RuntimeError("A CCL layout has inconsistent AlltoAll groups")
         if logical_source_sizes is None:
-            group_size = next(iter(all_to_all_group_sizes), 0)
-            logical_source_sizes = [int(num_tokens_unpadded)] * group_size
+            # Static batches give every DP rank the same tokens. Sequence-parallel
+            # MoE splits the padded graph batch into one chunk per TP rank, so
+            # real tokens fill the leading chunks.
+            sp_size = layout.sequence_parallel_size or 1
+            chunk = -(-int(layout.batch_descriptor.num_tokens) // sp_size)
+            logical_source_sizes = [
+                min(max(int(num_tokens_unpadded) - rank * chunk, 0), chunk)
+                for rank in range(sp_size)
+            ] * (layout.all_to_all_group_size // sp_size)
         else:
             logical_source_sizes = [int(size) for size in logical_source_sizes]
         if any(size < 0 for size in logical_source_sizes):
             raise ValueError("Logical EP source sizes must be non-negative")
-        for collective in layout.collectives:
-            metadata = collective.metadata
-            if metadata["op"] == "all_to_all" and len(
-                logical_source_sizes
-            ) != len(metadata["group_ranks"]):
-                raise RuntimeError(
-                    "Runtime logical EP sizes do not match the captured group"
-                )
+        if layout.all_to_all_group_size and (
+            len(logical_source_sizes) != layout.all_to_all_group_size
+        ):
+            raise RuntimeError(
+                "Runtime logical EP sizes do not match the captured group"
+            )
 
         slot_index = self._layout_slot_counts.get(key, 0)
         self._layout_slot_counts[key] = slot_index + 1
@@ -585,26 +842,19 @@ class CCLProfiler:
             )
         host_route_slot = layout.host_route_slots[slot_index]
 
-        if self._forward_events is None:
-            raise RuntimeError("CCL forward events were not prepared")
-        start, end = self._forward_events
         self._forward_id += 1
         self._profiled_forwards += 1
-        host_start_ns = monotonic_ns()
-        start.record()
-        token = self._forward_id
-        self._pending_forward = _PendingForward(
-            token=token,
+        step = _ProfiledStep(
+            token=self._forward_id,
             layout=layout,
-            start=start,
-            end=end,
             num_tokens_unpadded=int(num_tokens_unpadded),
             logical_source_sizes=logical_source_sizes,
             host_route_buffer=host_route_slot.buffer,
             host_routes=host_route_slot.routes,
-            host_start_ns=host_start_ns,
         )
-        return token
+        self._trace.mark()
+        self._step = step
+        return step.token
 
     def _allocate_host_route_slot(
         self, layout: _GraphLayout
@@ -625,81 +875,29 @@ class CCLProfiler:
         routes: dict[int, torch.Tensor] = {}
         for call_id in layer_ids:
             layer = layout.layers[call_id]
-            route_buffer = layer.route_buffer
-            if route_buffer is None or layer.route_offset is None:
+            if layer.route_offset is None:
                 raise RuntimeError(
-                    f"MoE layer {call_id} has no captured route buffer"
+                    f"MoE layer {call_id} has no captured route tensor"
                 )
-            elements = route_buffer.numel()
+            shape = layer.route_specs[-1].shape
             routes[call_id] = host_buffer[
-                layer.route_offset : layer.route_offset + elements
-            ].view(route_buffer.shape)
+                layer.route_offset : layer.route_offset + prod(shape)
+            ].view(shape)
         return _HostRouteSlot(host_buffer, routes)
 
-    def end_forward(self, token: int) -> None:
-        pending = self._require_pending_forward(token)
-        if pending.ended:
-            raise RuntimeError("Profiled forward was already ended")
-        pending.end.record()
-        pending.ended = True
-
-    def enqueue_route_snapshot(self, token: int) -> None:
-        """Enqueue route D2H copies before the caller's existing sync."""
-        pending = self._require_pending_forward(token)
-        if not pending.ended:
-            raise RuntimeError("Cannot snapshot routes before ending the forward")
-        if pending.routes_enqueued:
-            raise RuntimeError("MoE routes were already enqueued")
-        if pending.host_route_buffer is not None:
-            route_buffer = pending.layout.route_buffer
+    def end_step(self, token: int) -> None:
+        """End a profiled step after sampling and snapshot its MoE routes."""
+        step = self._step
+        if step is None or step.token != token:
+            raise RuntimeError(f"Unknown profiled step token: {token}")
+        self._trace.mark()
+        if step.host_route_buffer is not None:
+            route_buffer = step.layout.route_buffer
             assert route_buffer is not None
-            pending.host_route_buffer.copy_(route_buffer, non_blocking=True)
-        pending.routes_enqueued = True
-
-    def drain_forward(self, token: int) -> None:
-        """Resolve one replay after the caller's normal scheduler sync."""
-        pending = self._require_pending_forward(token)
-        if not pending.ended:
-            raise RuntimeError("Cannot drain an unfinished profiled forward")
-        if not pending.routes_enqueued:
-            raise RuntimeError("MoE route snapshots were not enqueued")
-
-        elapsed_ms = pending.start.elapsed_time(pending.end)
-        collective_times = [
-            (
-                pending.start.elapsed_time(collective.start),
-                pending.start.elapsed_time(collective.end),
-            )
-            for collective in pending.layout.collectives
-        ]
-        for start_ms, end_ms in collective_times:
-            if (
-                start_ms < 0
-                or end_ms < start_ms
-                or end_ms > elapsed_ms + 0.001
-            ):
-                raise RuntimeError(
-                    "CCL graph events are outside their model-forward interval"
-                )
-        self._drained_forwards.append(
-            _DrainedForward(
-                forward_id=pending.token,
-                layout=pending.layout,
-                elapsed_ms=elapsed_ms,
-                collective_times=collective_times,
-                num_tokens_unpadded=pending.num_tokens_unpadded,
-                logical_source_sizes=pending.logical_source_sizes,
-                host_routes=pending.host_routes,
-                host_start_ns=pending.host_start_ns,
-            )
-        )
-        self._pending_forward = None
-
-    def _require_pending_forward(self, token: int) -> _PendingForward:
-        pending = self._pending_forward
-        if pending is None or pending.token != token:
-            raise RuntimeError(f"Unknown profiled forward token: {token}")
-        return pending
+            torch.cat(step.layout.route_sources, out=route_buffer)
+            step.host_route_buffer.copy_(route_buffer, non_blocking=True)
+        self._finished_steps.append(step)
+        self._step = None
 
     def begin_collective(
         self, metadata: dict[str, Any] | None
@@ -712,11 +910,11 @@ class CCLProfiler:
 
         index = state.collective_index
         if state.kind == "prepare":
-            start = torch.cuda.Event(enable_timing=True, external=True)
-            end = torch.cuda.Event(enable_timing=True, external=True)
-            state.layout.collectives.append(
-                _CollectiveLayout(dict(metadata), start, end)
-            )
+            state.layout.collectives.append(_CollectiveLayout(dict(metadata)))
+            if self._trace.active:
+                tag_id = self._new_tag_id()
+                state.collective_tag_ids.append(tag_id)
+                self._trace.push(tag_id)
         else:
             if not torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
@@ -726,14 +924,11 @@ class CCLProfiler:
                 raise RuntimeError(
                     "Captured more collectives than the prepared CCL layout"
                 )
-            collective = state.layout.collectives[index]
-            if collective.metadata != metadata:
+            if state.layout.collectives[index].metadata != metadata:
                 raise RuntimeError(
                     "Captured collective metadata does not match the prepared layout"
                 )
-            start, end = collective.start, collective.end
 
-        start.record()
         state.open_collective = index
         state.collective_index += 1
         return index
@@ -744,8 +939,15 @@ class CCLProfiler:
         state = self._layout_pass
         if state is None or state.open_collective != token:
             raise RuntimeError("CCL collective token does not match the active layout")
-        state.layout.collectives[token].end.record()
+        if state.kind == "prepare" and self._trace.active:
+            self._trace.pop()
         state.open_collective = None
+
+    def add_eager_collective(self, metadata: dict[str, Any]) -> None:
+        """Record an eager collective that the profiled step launches next."""
+        if self._step is None:
+            raise RuntimeError("Eager CCL collectives require a profiled step")
+        self._step.eager_collectives.append(metadata)
 
     @contextmanager
     def moe_layer(
@@ -832,9 +1034,9 @@ class CCLProfiler:
                     "Captured MoE route shape does not match the prepared layout"
                 )
             if route_index == len(layer.route_specs) - 1:
-                if layer.route_buffer is None:
-                    raise RuntimeError("MoE route buffer was not prepared")
-                layer.route_buffer.copy_(topk_ids)
+                # The reference keeps this graph-pool block out of reuse, so
+                # every replay leaves the layer's routes in it.
+                layer.route_tensor = topk_ids
         state.route_indices[call_id] = route_index + 1
 
     @contextmanager
@@ -842,6 +1044,7 @@ class CCLProfiler:
         self,
         direction: EPDirection,
         logical_source_sizes: list[int] | None = None,
+        sequence_parallel_size: int = 1,
     ):
         state = self._layout_pass
         if state is None:
@@ -849,6 +1052,11 @@ class CCLProfiler:
             return
         if state.current_ep_direction is not None:
             raise RuntimeError("Nested EP profiler regions are not supported")
+        layout = state.layout
+        if state.kind == "prepare" and layout.sequence_parallel_size is None:
+            layout.sequence_parallel_size = sequence_parallel_size
+        elif layout.sequence_parallel_size != sequence_parallel_size:
+            raise RuntimeError("EP collectives disagree on sequence parallelism")
         state.current_ep_direction = direction
         state.current_ep_logical_source_sizes = (
             [int(size) for size in logical_source_sizes]
@@ -903,6 +1111,23 @@ class CCLProfiler:
         )
         return metadata
 
+    @staticmethod
+    def value_independent_metadata(
+        op: str,
+        tensor: torch.Tensor,
+        *,
+        group_ranks: list[int],
+        rank_in_group: int,
+    ) -> dict[str, Any]:
+        """Describe an AllGather or ReduceScatter by its per-rank input."""
+        assert op in ("all_gather", "reduce_scatter")
+        return {
+            "op": op,
+            "group_ranks": [int(rank) for rank in group_ranks],
+            "rank_in_group": int(rank_in_group),
+            "input_bytes": int(tensor.numel() * tensor.element_size()),
+        }
+
     def ep_metadata(
         self,
         *,
@@ -948,24 +1173,93 @@ class CCLProfiler:
             "logical_source_sizes": list(logical_sizes),
         }
 
-    def finish_iteration(self) -> dict[str, Any]:
+    def finish_iteration(self) -> None:
+        """Keep the iteration's steps until collect_iterations()."""
         if not self.iteration_active:
             raise RuntimeError("No CCL profiling iteration is active")
-        if self._pending_forward is not None:
-            raise RuntimeError("Cannot finish with an undrained profiled forward")
+        if self._step is not None:
+            raise RuntimeError("Cannot finish with an unfinished profiled step")
         self._validate_forward_count()
-
-        records = [
-            record
-            for forward in self._drained_forwards
-            for record in self._resolve_forward(forward)
-        ]
-        result = {"rank": self._rank, "records": records}
-
+        self._pending_iterations.append((self._rank, list(self._finished_steps)))
         self._iteration = None
-        self._drained_forwards.clear()
+        self._finished_steps.clear()
         self._layout_slot_counts.clear()
-        return result
+
+    def collect_iterations(self, last: int) -> list[dict[str, Any]]:
+        """Resolve the last finished iterations from one CUPTI flush.
+
+        Changing CUPTI state slows the requests that follow it for several
+        milliseconds, so the caller flushes once per case and lets warmup
+        iterations absorb the cost.
+        """
+        if self.iteration_active:
+            raise RuntimeError("Cannot collect during a profiling iteration")
+        pending, self._pending_iterations = self._pending_iterations, []
+        if not 0 < last <= len(pending):
+            raise ValueError(
+                f"Cannot collect the last {last} of {len(pending)} iterations"
+            )
+        activities, _ = self._trace.drain()
+        overflows, self._trace.overflows = self._trace.overflows, 0
+        if overflows:
+            raise RuntimeError(
+                "The CUPTI record buffer filled during profiled iterations, so "
+                "its conversion ran during measured steps; increase "
+                "_TRACE_BUFFER_BYTES"
+            )
+        if any(
+            activity.start <= 0 or activity.end < activity.start
+            for activity in activities
+        ):
+            raise RuntimeError("CUPTI lost GPU timestamps in a profiled iteration")
+        # Each step launched one marker before its forward and one after
+        # sampling on its compute stream; its GPU work is what ran between them.
+        # Graph replays stay in stream order but report the internal streams
+        # of their kernels, so kernels count from any stream. Copies count
+        # only from the compute stream, which excludes vLLM's async output
+        # copies of earlier steps.
+        activities.sort(key=lambda activity: activity.start)
+        markers = [
+            activity for activity in activities if _STEP_MARKER in activity.name
+        ]
+        step_count = sum(len(steps) for _, steps in pending)
+        if len(markers) != 2 * step_count:
+            raise RuntimeError(
+                f"CUPTI recorded {len(markers)} step markers for "
+                f"{step_count} profiled steps"
+            )
+        streams = {marker.stream_id for marker in markers}
+        if len(streams) != 1:
+            raise RuntimeError("Profiled steps ran on different CUDA streams")
+        stream_id = streams.pop()
+        work = [
+            activity
+            for activity in activities
+            if (activity.name or activity.stream_id == stream_id)
+            and _STEP_MARKER not in activity.name
+        ]
+        work_starts = [activity.start for activity in work]
+
+        results = []
+        marker_index = 2 * sum(len(steps) for _, steps in pending[:-last])
+        for rank, steps in pending[-last:]:
+            records = []
+            for step in steps:
+                begin, end = markers[marker_index], markers[marker_index + 1]
+                marker_index += 2
+                window = work[
+                    bisect_left(work_starts, begin.end) : bisect_left(
+                        work_starts, end.start
+                    )
+                ]
+                records.extend(
+                    self._resolve_step(
+                        step,
+                        [activity for activity in window if activity.end <= end.start],
+                    )
+                )
+            results.append({"rank": rank, "records": records})
+        return results
 
     def _validate_forward_count(self) -> None:
         assert self._iteration is not None
@@ -984,59 +1278,116 @@ class CCLProfiler:
                 f"forwards, expected {expected}"
             )
 
-    def _resolve_forward(self, forward: _DrainedForward) -> list[dict[str, Any]]:
+    def _resolve_step(
+        self,
+        step: _ProfiledStep,
+        activities: list[GpuActivity],
+    ) -> list[dict[str, Any]]:
+        if not activities:
+            raise RuntimeError(f"CUPTI recorded no GPU work for step {step.token}")
+        nccl_kernels = [
+            activity for activity in activities if _is_nccl_kernel(activity.name)
+        ]
+
+        # A logical collective spans from its first NCCL kernel start to its
+        # last NCCL kernel end.
+        layout = step.layout
+        graph_kernels = [kernel for kernel in nccl_kernels if kernel.graph_id]
+        expected_names = [
+            name
+            for collective in layout.collectives
+            for name in collective.kernel_names or ()
+        ]
+        if [kernel.name for kernel in graph_kernels] != expected_names:
+            raise RuntimeError(
+                f"Step {step.token} replayed NCCL kernels "
+                f"{[kernel.name for kernel in graph_kernels]}, expected "
+                f"{expected_names}"
+            )
+        timings: list[tuple[dict[str, Any], int, int]] = []
+        position = 0
+        for collective in layout.collectives:
+            assert collective.kernel_names is not None
+            kernels = graph_kernels[position : position + len(collective.kernel_names)]
+            position += len(kernels)
+            timings.append(
+                (
+                    collective.metadata,
+                    kernels[0].start,
+                    max(kernel.end for kernel in kernels),
+                )
+            )
+
+        # Each eager collective, such as the logits all-gather, launches one
+        # NCCL kernel outside the graphs, in step order.
+        eager_kernels = [kernel for kernel in nccl_kernels if not kernel.graph_id]
+        if len(eager_kernels) != len(step.eager_collectives):
+            raise RuntimeError(
+                f"Step {step.token} ran eager NCCL kernels "
+                f"{[kernel.name for kernel in eager_kernels]} for "
+                f"{len(step.eager_collectives)} recorded eager collectives"
+            )
+        for metadata, kernel in zip(step.eager_collectives, eager_kernels):
+            timings.append((metadata, kernel.start, kernel.end))
+
         records: list[dict[str, Any]] = [
             {
                 "op": "forward",
-                "forward_id": forward.forward_id,
-                "elapsed_ms": forward.elapsed_ms,
-                "host_start_ns": forward.host_start_ns,
+                "forward_id": step.token,
+                "start_ns": activities[0].start,
+                "end_ns": max(activity.end for activity in activities),
             }
         ]
-        for collective, (start_ms, end_ms) in zip(
-            forward.layout.collectives, forward.collective_times
-        ):
-            metadata = dict(collective.metadata)
+        for metadata, start_ns, end_ns in timings:
+            metadata = dict(metadata)
             if metadata["op"] == "all_to_all":
-                metadata["logical_source_sizes"] = list(
-                    forward.logical_source_sizes
-                )
+                metadata["logical_source_sizes"] = list(step.logical_source_sizes)
             result = {
                 "op": metadata["op"],
-                "forward_id": forward.forward_id,
+                "forward_id": step.token,
                 "group_ranks": metadata["group_ranks"],
-                "start_offset_ms": start_ms,
-                "end_offset_ms": end_ms,
+                "start_ns": start_ns,
+                "end_ns": end_ns,
             }
             if metadata["rank_in_group"] == 0:
+                group_size = len(metadata["group_ranks"])
                 if metadata["op"] == "all_reduce":
-                    pattern = self._resolve_all_reduce(
-                        metadata,
-                        forward.host_routes,
-                        forward,
+                    pattern = self._resolve_all_reduce(metadata, step)
+                    physical_source_rows = [
+                        int(metadata.get("tensor_rows", 1))
+                    ] * group_size
+                elif metadata["op"] == "all_gather":
+                    pattern = (
+                        metadata["input_bytes"],
+                        *_packed_pattern(
+                            [1 << rank for rank in range(group_size)],
+                            [(1 << group_size) - 1] * group_size,
+                            group_size,
+                        ),
                     )
+                    physical_source_rows = [1] * group_size
+                elif metadata["op"] == "reduce_scatter":
+                    # Every rank contributes every chunk; chunk i goes to rank i.
+                    pattern = (
+                        metadata["input_bytes"] // group_size,
+                        *_packed_pattern(
+                            [(1 << group_size) - 1] * group_size,
+                            [1 << rank for rank in range(group_size)],
+                            group_size,
+                        ),
+                    )
+                    physical_source_rows = [group_size] * group_size
                 else:
                     assert metadata["op"] == "all_to_all"
-                    pattern = self._resolve_ep(
-                        metadata,
-                        forward.host_routes,
-                        forward.layout,
-                    )
-                bytes_per_row, source_masks, destination_masks = pattern
-                result["bytes_per_row"] = bytes_per_row
-                if metadata["op"] == "all_to_all":
+                    pattern = self._resolve_ep(metadata, step)
                     if metadata["direction"] == "dispatch":
                         physical_source_rows = metadata["source_sizes"]
                     else:
-                        rows_per_rank = sum(metadata["source_sizes"])
-                        physical_source_rows = [rows_per_rank] * len(
-                            metadata["group_ranks"]
-                        )
-                else:
-                    physical_rows = int(metadata.get("tensor_rows", 1))
-                    physical_source_rows = [physical_rows] * len(
-                        metadata["group_ranks"]
-                    )
+                        physical_source_rows = [
+                            sum(metadata["source_sizes"])
+                        ] * group_size
+                bytes_per_row, source_masks, destination_masks = pattern
+                result["bytes_per_row"] = bytes_per_row
                 result["physical_source_rows"] = physical_source_rows
                 result["source_masks"] = base64.b64encode(source_masks).decode(
                     "ascii"
@@ -1051,8 +1402,7 @@ class CCLProfiler:
     def _resolve_all_reduce(
         self,
         record: dict[str, Any],
-        routes_by_layer: dict[int, torch.Tensor],
-        forward: _DrainedForward,
+        step: _ProfiledStep,
     ) -> tuple[int, bytes, bytes | None]:
         ranks = record["group_ranks"]
         full_mask = (1 << len(ranks)) - 1
@@ -1063,8 +1413,8 @@ class CCLProfiler:
             return record["input_bytes"], source_masks, destination_masks
 
         call_id = record["layer_call_id"]
-        layer = forward.layout.layers[call_id]
-        routes = routes_by_layer.get(call_id)
+        layer = step.layout.layers[call_id]
+        routes = step.host_routes.get(call_id)
         if routes is None or routes.ndim != 2:
             raise RuntimeError("MoE routes were not captured for final AllReduce")
 
@@ -1077,11 +1427,11 @@ class CCLProfiler:
                 raise RuntimeError("MoE route ranks do not include this rank")
             source_rank = layer.route_group_ranks.index(self._rank)
             route_start = sum(layer.route_source_sizes[:source_rank])
-            if len(forward.logical_source_sizes) != len(layer.route_group_ranks):
+            if len(step.logical_source_sizes) != len(layer.route_group_ranks):
                 raise RuntimeError(
                     "Runtime logical EP sizes do not match MoE route ranks"
                 )
-            route_count = forward.logical_source_sizes[source_rank]
+            route_count = step.logical_source_sizes[source_rank]
             if (
                 route_count > tensor_rows
                 or routes.shape[0] < route_start + route_count
@@ -1089,7 +1439,7 @@ class CCLProfiler:
                 raise RuntimeError("MoE routes do not match final AllReduce rows")
             routes = routes[route_start : route_start + route_count]
         else:
-            route_count = forward.num_tokens_unpadded
+            route_count = step.num_tokens_unpadded
             if route_count > tensor_rows or routes.shape[0] < route_count:
                 raise RuntimeError("MoE routes do not match final AllReduce rows")
             routes = routes[:route_count]
@@ -1125,15 +1475,14 @@ class CCLProfiler:
             destination_masks,
         )
 
+    @staticmethod
     def _resolve_ep(
-        self,
         record: dict[str, Any],
-        routes_by_layer: dict[int, torch.Tensor],
-        layout: _GraphLayout,
+        step: _ProfiledStep,
     ) -> tuple[int, bytes, bytes | None]:
         call_id = record["layer_call_id"]
-        layer = layout.layers[call_id]
-        routes = routes_by_layer.get(call_id)
+        layer = step.layout.layers[call_id]
+        routes = step.host_routes.get(call_id)
         if routes is None:
             raise RuntimeError("MoE routes were not captured for AlltoAll")
         return _ep_pattern(
