@@ -1255,6 +1255,7 @@ class Worker(WorkerBase):
         get_ccl_profiler().start_iteration(
             phase=phase,
             rank=profile_rank,
+            ranks=self.parallel_config.world_size_across_dp,
             batch_size=batch_size,
             input_len=input_len,
             output_len=output_len,

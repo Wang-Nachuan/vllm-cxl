@@ -3,6 +3,7 @@
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass
+from math import prod
 from typing import Any
 
 import torch
@@ -40,6 +41,19 @@ if has_flashinfer_nvlink_one_sided():
 
 
 logger = init_logger(__name__)
+
+
+def _dispatch_row_bytes(
+    hidden_states: torch.Tensor, extra_tensors: list[torch.Tensor] | None
+) -> int:
+    """Bytes of one dispatched token: its hidden state in the MoE kernel's input
+    format plus the per-token tensors that travel with it, such as the scales of
+    a quantized input. Routing metadata (top-k ids and weights, router logits)
+    is not counted."""
+    return sum(
+        prod(tensor.shape[1:]) * tensor.element_size()
+        for tensor in [hidden_states, *(extra_tensors or ())]
+    )
 
 
 class AgRsAll2AllManager(All2AllManagerBase):
@@ -121,6 +135,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
                 "dispatch",
                 self._get_logical_sizes(sizes, is_sequence_parallel),
                 len(sizes) // self.dp_world_size if is_sequence_parallel else 1,
+                _dispatch_row_bytes(hidden_states, extra_tensors),
             )
             if ccl_profiler.capture_active
             else nullcontext()
@@ -164,6 +179,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
                 "dispatch",
                 self._get_logical_sizes(sizes, is_sequence_parallel),
                 len(sizes) // self.dp_world_size if is_sequence_parallel else 1,
+                _dispatch_row_bytes(hidden_states, extra_tensors),
             )
             if ccl_profiler.capture_active
             else nullcontext()

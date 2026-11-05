@@ -274,18 +274,37 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def all_reduce(self, input_):
         ccl_profiler = get_ccl_profiler()
         if ccl_profiler.capture_active:
+            # vLLM's choice between its custom AllReduce and PyNccl; the
+            # profiler's settings disable the other implementations.
+            ca_comm = self.ca_comm
+            use_ca = (
+                ca_comm is not None
+                and not ca_comm.disabled
+                and ca_comm.should_custom_ar(input_)
+            )
             pynccl_comm = self.pynccl_comm
-            if pynccl_comm is None or pynccl_comm.disabled:
+            if not use_ca and (pynccl_comm is None or pynccl_comm.disabled):
                 raise RuntimeError("CCL profiling requires PyNccl AllReduce")
             profile_metadata = ccl_profiler.all_reduce_metadata(
                 input_,
                 group_ranks=self.ranks,
                 rank_in_group=self.rank_in_group,
             )
-            out = torch.empty_like(input_)
             profile_token = ccl_profiler.begin_collective(profile_metadata)
             try:
-                out = pynccl_comm.all_reduce(input_, out_tensor=out)
+                if use_ca:
+                    # Not custom_all_reduce(): it launches no kernel in the eager
+                    # passes of a graph-capture context, which include the pass
+                    # that learns each collective's kernels.
+                    out = ca_comm.all_reduce(
+                        input_,
+                        registered=ca_comm._IS_CAPTURING
+                        and torch.cuda.is_current_stream_capturing(),
+                    )
+                else:
+                    out = pynccl_comm.all_reduce(
+                        input_, out_tensor=torch.empty_like(input_)
+                    )
             finally:
                 ccl_profiler.end_collective(profile_token)
             if out is None:

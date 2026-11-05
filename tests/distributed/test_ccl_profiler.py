@@ -130,7 +130,7 @@ def _captured_decode_profiler(
         _all_reduce(profiler, None, trace)
         _all_reduce(profiler, None, trace)
     profiler.start_iteration(
-        phase="decode", rank=0, batch_size=1, input_len=4, output_len=2
+        phase="decode", rank=0, ranks=1, batch_size=1, input_len=4, output_len=2
     )
     assert not profiler.select_forward({"request": 4})
     assert profiler.select_forward({"request": 1})
@@ -388,7 +388,7 @@ def test_graph_all_gather_and_reduce_scatter_are_logical_collectives(
     with profiler.capture_layout(_Mode.FULL, descriptor):
         collectives([None, None])
     profiler.start_iteration(
-        phase="decode", rank=0, batch_size=1, input_len=4, output_len=2
+        phase="decode", rank=0, ranks=1, batch_size=1, input_len=4, output_len=2
     )
     assert not profiler.select_forward({"request": 4})
     assert profiler.select_forward({"request": 1})
@@ -454,7 +454,7 @@ def test_collect_resolves_only_the_last_iterations(monkeypatch) -> None:
     for offset in (0, 2000):
         if offset:
             profiler.start_iteration(
-                phase="decode", rank=0, batch_size=1, input_len=4, output_len=2
+                phase="decode", rank=0, ranks=1, batch_size=1, input_len=4, output_len=2
             )
             assert not profiler.select_forward({"request": 4})
             assert profiler.select_forward({"request": 1})
@@ -556,6 +556,27 @@ def test_lost_cupti_timestamps_fail(monkeypatch) -> None:
         _finish(profiler)
 
 
+def test_lost_cupti_timestamps_outside_measured_steps_are_ignored(
+    monkeypatch,
+) -> None:
+    profiler, trace = _captured_decode_profiler(monkeypatch)
+    # Launched before the step's first marker, like the unrecorded prefill.
+    trace.launch([("prefill_kernel", 0, 0)])
+
+    _run_decode_step(
+        profiler,
+        trace,
+        [
+            ("ncclDevKernel_AllReduce", 1020, 1100),
+            ("ncclDevKernel_Reduce", 1210, 1250),
+            ("ncclDevKernel_Reduce", 1300, 1400),
+        ],
+    )
+
+    forward = _finish(profiler)["records"][0]
+    assert (forward["start_ns"], forward["end_ns"]) == (1020, 1750)
+
+
 def test_route_snapshot_reads_the_held_graph_tensor_after_replay() -> None:
     route = torch.zeros((2, 2), dtype=torch.int32)
     layout = ccl_profiler._GraphLayout(
@@ -595,6 +616,7 @@ def test_decode_preallocation_accepts_piecewise_only_graphs() -> None:
     profiler.start_iteration(
         phase="decode",
         rank=0,
+        ranks=1,
         batch_size=4,
         input_len=16,
         output_len=2,
@@ -625,6 +647,7 @@ def test_prefill_preallocates_every_possible_graph_mode() -> None:
     profiler.start_iteration(
         phase="prefill",
         rank=0,
+        ranks=1,
         batch_size=1,
         input_len=1,
         output_len=1,
@@ -645,6 +668,7 @@ def test_zero_token_scheduler_cleanup_is_not_a_profiled_forward() -> None:
     profiler.start_iteration(
         phase="prefill",
         rank=0,
+        ranks=1,
         batch_size=1,
         input_len=1,
         output_len=1,

@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import mmap
+import os
+import struct
 import threading
 from bisect import bisect_left
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from math import prod
@@ -32,6 +35,8 @@ EPDirection = Literal["dispatch", "combine"]
 # One buffer holds every iteration of a case; see collect_iterations().
 _TRACE_BUFFER_BYTES = 256 << 20
 _STEP_MARKER = "spin_kernel"
+# A held step normally takes its host tens of milliseconds to queue.
+_GATE_TIMEOUT_S = 2.0
 
 
 class GpuActivity(NamedTuple):
@@ -42,6 +47,9 @@ class GpuActivity(NamedTuple):
     stream_id: int
     # Empty for memcpy and memset records.
     name: str
+    # CTAs and threads per CTA of a kernel; 0 for memcpy and memset records.
+    grid: int = 0
+    block: int = 0
 
 
 class CorrelationTag(NamedTuple):
@@ -49,8 +57,9 @@ class CorrelationTag(NamedTuple):
     correlation_id: int
 
 
-def _is_nccl_kernel(name: str) -> bool:
-    return "nccl" in name
+def _is_collective_kernel(name: str) -> bool:
+    """An NCCL kernel or a kernel of vLLM's custom AllReduce."""
+    return "nccl" in name or "cross_device_reduce" in name
 
 
 class _CuptiTrace:
@@ -194,6 +203,8 @@ class _CuptiTrace:
                         record.graph_id,
                         record.stream_id,
                         record.name,
+                        record.grid_x * record.grid_y * record.grid_z,
+                        record.block_x * record.block_y * record.block_z,
                     )
                 )
             elif kind in self._copy_kinds:
@@ -217,6 +228,95 @@ class _CuptiTrace:
         with self._lock:
             self._activities.extend(activities)
             self._tags.extend(tags)
+
+
+class _StepGate:
+    """Holds each measured step on every rank's GPU until all ranks queued it.
+
+    Software CUPTI tracing (below Blackwell) costs the host about 3.4 us per
+    node of every CUDA-graph launch before the GPU starts the graph, so a decode
+    step takes the host longer than the GPU. Steps would then start milliseconds
+    apart across ranks, and a rank's GPU would idle inside a step while its host
+    still launches the logits all-gather or sampling. Each rank's GPU therefore
+    waits on a host page shared by all ranks until every rank has written the
+    step's sequence number there, which a rank does after queuing the whole
+    step. The step then runs as in a GPU-bound run, all ranks starting together.
+
+    Software tracing launches graph nodes one by one, so a held step fills
+    CUDA's launch queue, and a full queue blocks the host until the GPU drains
+    it. initialize_tracing() scales the queues 4x (8000 held kernels fit,
+    12000 do not, on H200). Should a step still not fit, a watchdog opens this
+    rank's slot after _GATE_TIMEOUT_S instead of deadlocking, and the step is
+    marked, which fails its case if it is measured.
+    """
+
+    def __init__(self, path: str, rank: int, ranks: int) -> None:
+        from cuda.bindings import driver
+
+        fd = os.open(path, os.O_RDWR)
+        try:
+            self._page = mmap.mmap(fd, mmap.PAGESIZE)
+        finally:
+            os.close(fd)
+        address = ctypes.addressof(ctypes.c_char.from_buffer(self._page))
+        (result,) = driver.cuMemHostRegister(
+            address, mmap.PAGESIZE, driver.CU_MEMHOSTREGISTER_DEVICEMAP
+        )
+        if result != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuMemHostRegister failed: {result}")
+        result, device_address = driver.cuMemHostGetDevicePointer(address, 0)
+        if result != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuMemHostGetDevicePointer failed: {result}")
+        self._slots = [
+            driver.CUdeviceptr(int(device_address) + 4 * slot)
+            for slot in range(ranks)
+        ]
+        self._driver = driver
+        self._rank = rank
+        self._sequence = 0
+        # The held step's sequence number, 0 once released.
+        self._held = 0
+        self._held_changed = threading.Condition()
+        self.timed_out: set[int] = set()
+        threading.Thread(target=self._watch, name="ccl-step-gate", daemon=True).start()
+
+    @property
+    def sequence(self) -> int:
+        return self._sequence
+
+    def hold(self) -> None:
+        """Make the current stream wait until every rank queued the next step."""
+        self._sequence += 1
+        stream = self._driver.CUstream(torch.cuda.current_stream().cuda_stream)
+        for slot in self._slots:
+            # Flags 0 wait for a cyclic greater-or-equal value.
+            (result,) = self._driver.cuStreamWaitValue32(
+                stream, slot, self._sequence, 0
+            )
+            if result != self._driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"cuStreamWaitValue32 failed: {result}")
+        with self._held_changed:
+            self._held = self._sequence
+            self._held_changed.notify()
+
+    def release(self) -> None:
+        """Mark this rank's current step as completely queued."""
+        with self._held_changed:
+            self._held = 0
+            self._held_changed.notify()
+        struct.pack_into("<I", self._page, 4 * self._rank, self._sequence)
+
+    def _watch(self) -> None:
+        with self._held_changed:
+            while True:
+                self._held_changed.wait_for(lambda: self._held != 0)
+                sequence = self._held
+                if not self._held_changed.wait_for(
+                    lambda: self._held != sequence, timeout=_GATE_TIMEOUT_S
+                ):
+                    self.timed_out.add(sequence)
+                    struct.pack_into("<I", self._page, 4 * self._rank, sequence)
+                    self._held_changed.wait_for(lambda: self._held != sequence)
 
 
 @dataclass
@@ -278,6 +378,7 @@ class _LayoutPass:
     current_layer_call_id: int | None = None
     current_ep_direction: EPDirection | None = None
     current_ep_logical_source_sizes: list[int] | None = None
+    current_ep_row_bytes: int | None = None
     deferred_moe_all_reduce: tuple[int, int] | None = None
     open_collective: int | None = None
     route_indices: dict[int, int] = field(default_factory=dict)
@@ -293,6 +394,8 @@ class _ProfiledStep:
     host_route_buffer: torch.Tensor | None
     host_routes: dict[int, torch.Tensor]
     eager_collectives: list[dict[str, Any]] = field(default_factory=list)
+    # The step gate opened on its watchdog, before the host queued the step.
+    gate_timed_out: bool = False
 
 
 def _expert_owner_table(
@@ -450,6 +553,8 @@ class CCLProfiler:
         self._pending_iterations: list[tuple[int, list[_ProfiledStep]]] = []
         self._layout_slot_counts: dict[tuple[Any, Any], int] = {}
         self._next_tag_id = 1
+        self._software_trace = False
+        self._gate: _StepGate | None = None
 
     @property
     def iteration_active(self) -> bool:
@@ -466,10 +571,16 @@ class CCLProfiler:
         return self._step is not None
 
     def initialize_tracing(self, *, hw_trace: bool) -> None:
+        if not hw_trace:
+            # Read at CUDA context creation, which follows (_StepGate).
+            os.environ["CUDA_SCALE_LAUNCH_QUEUES"] = "4x"
         self._trace.initialize(hw_trace)
+        self._software_trace = not hw_trace
         logger.info(
-            "CCL profiler timestamps GPU kernels with CUPTI %s tracing",
+            "CCL profiler timestamps GPU kernels with CUPTI %s tracing%s",
             "hardware" if hw_trace else "software",
+            "" if hw_trace else " and holds each measured step until all ranks "
+            "queued it",
         )
 
     def start_tracing(self) -> None:
@@ -605,7 +716,7 @@ class CCLProfiler:
                 kernel.name
                 for kernel in sorted(kernels[index], key=lambda kernel: kernel.start)
             ]
-            if not names or not all(_is_nccl_kernel(name) for name in names):
+            if not names or not all(_is_collective_kernel(name) for name in names):
                 raise RuntimeError(
                     f"Logical collective {index} launched unexpected kernels: {names}"
                 )
@@ -682,6 +793,7 @@ class CCLProfiler:
         *,
         phase: ProfilePhase,
         rank: int,
+        ranks: int,
         batch_size: int,
         input_len: int,
         output_len: int,
@@ -698,6 +810,14 @@ class CCLProfiler:
             raise ValueError("Prefill profiling requires output_len=1")
         if not self._trace.active:
             raise RuntimeError("CUPTI tracing is not active")
+        if self._software_trace and self._gate is None:
+            path = os.environ.get("CCL_PROFILER_GATE")
+            if path is None:
+                raise RuntimeError(
+                    "Software CUPTI tracing holds measured steps on a host page "
+                    "shared by all ranks; set CCL_PROFILER_GATE to its file"
+                )
+            self._gate = _StepGate(path, int(rank), int(ranks))
 
         self._iteration = {
             "phase": phase,
@@ -852,6 +972,8 @@ class CCLProfiler:
             host_route_buffer=host_route_slot.buffer,
             host_routes=host_route_slot.routes,
         )
+        if self._gate is not None:
+            self._gate.hold()
         self._trace.mark()
         self._step = step
         return step.token
@@ -896,6 +1018,9 @@ class CCLProfiler:
             assert route_buffer is not None
             torch.cat(step.layout.route_sources, out=route_buffer)
             step.host_route_buffer.copy_(route_buffer, non_blocking=True)
+        if self._gate is not None:
+            self._gate.release()
+            step.gate_timed_out = self._gate.sequence in self._gate.timed_out
         self._finished_steps.append(step)
         self._step = None
 
@@ -1045,7 +1170,10 @@ class CCLProfiler:
         direction: EPDirection,
         logical_source_sizes: list[int] | None = None,
         sequence_parallel_size: int = 1,
+        row_bytes: int | None = None,
     ):
+        """row_bytes: a dispatch row in the format it is sent, which the MoE
+        kernel's input quantization decides (for example FP8 plus scales)."""
         state = self._layout_pass
         if state is None:
             yield
@@ -1063,11 +1191,13 @@ class CCLProfiler:
             if logical_source_sizes is not None
             else None
         )
+        state.current_ep_row_bytes = row_bytes
         try:
             yield
         finally:
             state.current_ep_direction = None
             state.current_ep_logical_source_sizes = None
+            state.current_ep_row_bytes = None
 
     def defer_moe_final_all_reduce(self, logical_width: int) -> None:
         state = self._layout_pass
@@ -1171,6 +1301,7 @@ class CCLProfiler:
             "layer_call_id": layer.call_id,
             "source_sizes": sizes,
             "logical_source_sizes": list(logical_sizes),
+            "row_bytes": state.current_ep_row_bytes,
         }
 
     def finish_iteration(self) -> None:
@@ -1207,11 +1338,11 @@ class CCLProfiler:
                 "its conversion ran during measured steps; increase "
                 "_TRACE_BUFFER_BYTES"
             )
-        if any(
-            activity.start <= 0 or activity.end < activity.start
-            for activity in activities
-        ):
-            raise RuntimeError("CUPTI lost GPU timestamps in a profiled iteration")
+        if any(step.gate_timed_out for _, steps in pending[-last:] for step in steps):
+            raise RuntimeError(
+                "A measured step started on the step gate's timeout, before its "
+                "host queued it: CUDA's launch queue could not hold the step"
+            )
         # Each step launched one marker before its forward and one after
         # sampling on its compute stream; its GPU work is what ran between them.
         # Graph replays stay in stream order but report the internal streams
@@ -1231,6 +1362,31 @@ class CCLProfiler:
         streams = {marker.stream_id for marker in markers}
         if len(streams) != 1:
             raise RuntimeError("Profiled steps ran on different CUDA streams")
+        # One stream runs the markers in launch order, which correlation IDs
+        # number; a marker that lost its timestamps sorts out of that order.
+        correlations = [marker.correlation_id for marker in markers]
+        if any(a >= b for a, b in zip(correlations, correlations[1:])):
+            raise RuntimeError("CUPTI timestamps put step markers out of order")
+        marker_index = 2 * sum(len(steps) for _, steps in pending[:-last])
+        # A measured step owns the GPU work launched from its first marker to its
+        # last, which must keep its timestamps; losses elsewhere do not matter.
+        windows = [
+            (markers[index].correlation_id, markers[index + 1].correlation_id)
+            for index in range(marker_index, len(markers), 2)
+        ]
+        lost = Counter(
+            activity.name[:120] or "memcpy/memset"
+            for activity in activities
+            if (activity.start <= 0 or activity.end < activity.start)
+            and any(
+                begin <= activity.correlation_id <= end for begin, end in windows
+            )
+        )
+        if lost:
+            raise RuntimeError(
+                "CUPTI lost GPU timestamps in a measured step: "
+                f"{dict(lost.most_common(8))}"
+            )
         stream_id = streams.pop()
         work = [
             activity
@@ -1241,7 +1397,6 @@ class CCLProfiler:
         work_starts = [activity.start for activity in work]
 
         results = []
-        marker_index = 2 * sum(len(steps) for _, steps in pending[:-last])
         for rank, steps in pending[-last:]:
             records = []
             for step in steps:
@@ -1286,7 +1441,7 @@ class CCLProfiler:
         if not activities:
             raise RuntimeError(f"CUPTI recorded no GPU work for step {step.token}")
         nccl_kernels = [
-            activity for activity in activities if _is_nccl_kernel(activity.name)
+            activity for activity in activities if _is_collective_kernel(activity.name)
         ]
 
         # A logical collective spans from its first NCCL kernel start to its
@@ -1495,7 +1650,9 @@ class CCLProfiler:
             layer.ep_group_ranks,
             record["group_ranks"],
             layer.placement,
-            layer.activation_width * layer.activation_element_size,
+            record["row_bytes"]
+            if record["direction"] == "dispatch"
+            else layer.activation_width * layer.activation_element_size,
         )
 
 
